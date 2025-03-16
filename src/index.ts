@@ -1,152 +1,216 @@
-// Import necessary modules from the MCP SDK
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-// Import zod for schema validation and type safety
 import { z } from "zod";
+import fs from 'fs/promises';
+import path from 'path';
+import { execSync } from "child_process";
 
-// Define constants for your API integrations
-const API_BASE_URL = "https://api.example.com"; // Replace with your API base URL
-const USER_AGENT = "mcp-server/1.0"; // User-Agent header value for API requests
-
-// Create an MCP server instance with a name and version
-// This is the main entry point for our MCP implementation
+// Create an MCP server
 const server = new McpServer({
-  name: "my-mcp-server", // Server identifier in the MCP ecosystem - replace with your server name
-  version: "1.0.0" // Semantic versioning for our server
+  name: "TranscriptManager",
+  version: "1.0.0"
 });
 
-/**
- * Helper function to make API requests
- *
- * @param url - The full URL endpoint to request data from
- * @returns A Promise that resolves to the parsed JSON response, or null if the request fails
- * @template T - Type parameter for the expected response data structure
- */
-async function makeApiRequest<T>(url: string, options = {}): Promise<T | null> {
-  // Create default headers for the API request
-  const defaultHeaders = {
-    "User-Agent": USER_AGENT,
-    "Content-Type": "application/json"
-  };
+// Define course path mappings
+const COURSE_NOTES_PATHS: { [key: string]: string } = {
+  "Approximations Algorithms": "/Users/lmarte/Documents/Obsidian Vault/Approx-Algo-LP",
+  "Math": "/Users/lmarte/Documents/Obsidian Vault/Math",
+  // Add more course mappings as needed
+};
 
-  const requestOptions = {
-    headers: { ...defaultHeaders, ...(options as any).headers },
-    ...(options || {})
-  };
+// Define transcript location mappings - where transcripts are stored
+const COURSE_TRANSCRIPT_PATHS: { [key: string]: string } = {
+  "Approximations Algorithms": "/Users/lmarte/Documents/Projects/CU-Boulder/Data-Structures-Algo/Approx-Algo-LP",
+  "Math": "/Users/lmarte/Documents/Obsidian Vault/Math/transcripts",
+  // Add more mappings as needed
+};
 
-  try {
-    // Make the HTTP request with fetch API
-    const response = await fetch(url, requestOptions);
+// Define default notes output location
+const DEFAULT_NOTES_PATH = "/Users/lmarte/Documents/Obsidian Vault";
+const DEFAULT_TRANSCRIPT_PATH = "/Users/lmarte/Documents/Transcripts";
 
-    // Check if the response was successful (status code 200-299)
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    // Parse the JSON response and cast it to the expected type
-    return (await response.json()) as T;
-  } catch (error) {
-    // Log any errors that occur during the request
-    console.error("Error making API request:", error);
-    return null; // Return null to indicate a failed request
-  }
-}
-
-/**
- * Interface for generic API responses
- * Replace or extend this with your specific API response structures
- */
-interface ApiResponse {
-  // Define the structure of your API responses here
-  success: boolean;
-  data?: any;
-  message?: string;
-}
-
-/**
- * Utility function to format API data into a human-readable string
- * Customize this function based on your specific data format
- */
-function formatResponse(data: any): string {
-  // Implement custom formatting logic here
-  if (typeof data === 'object') {
-    return JSON.stringify(data, null, 2);
-  }
-  return String(data);
-}
-
-// -----------------------------------------------------------------------------
-// REGISTER YOUR MCP TOOLS BELOW
-// -----------------------------------------------------------------------------
-
-// EXAMPLE TOOL TEMPLATE:
-// server.tool(
-//   "tool_name", // Tool name - used by clients to call this tool
-//   "Tool description", // Tool description - helps clients understand the purpose
-//   {
-//     // Define the input schema using zod for validation
-//     param1: z.string().describe("Description of param1"),
-//     param2: z.number().describe("Description of param2")
-//   },
-//   // Tool implementation function - what happens when this tool is called
-//   async ({ param1, param2 }) => {
-//     // Implement your tool logic here
-//     // ...
-//
-//     // Return the result in the format expected by the MCP protocol
-//     return {
-//       content: [
-//         {
-//           type: "text", // Content type (text, image, etc.)
-//           text: "Your response text here" // The actual response text
-//         }
-//       ]
-//     };
-//   }
-// );
-
-// Example tool implementation
+// Define a tool that can list available courses and their paths
 server.tool(
-  "example_tool", 
-  "Example tool that demonstrates the basic structure", 
-  {
-    input: z.string().describe("Input data to process")
-  },
-  async ({ input }) => {
-    // Process the input
-    const processedInput = `Processed: ${input}`;
+  "list-courses",
+  "List all available course folders and their paths",
+  {},
+  async () => {
+    const courseList = Object.keys(COURSE_NOTES_PATHS).map(course => {
+      const notesPath = COURSE_NOTES_PATHS[course];
+      const transcriptPath = COURSE_TRANSCRIPT_PATHS[course];
+      return `${course}:\n  - Notes: ${notesPath}\n  - Transcripts: ${transcriptPath}`;
+    }).join('\n\n');
     
-    // Return the result
     return {
       content: [
         {
           type: "text",
-          text: processedInput
+          text: `Available courses and their paths:\n\n${courseList}`
         }
       ]
     };
   }
 );
 
-/**
- * Main function to initialize and connect the MCP server
- */
+
+// Enhanced tool with course path mapping
+server.tool(
+  "generate-notes-from-source",
+  "Generate lecture notes from various transcript sources with automatic path resolution",
+  {
+    // Basic info about the lecture
+    courseName: z.string().describe("The name of the course (matches a known course folder)"),
+    lectureNumber: z.string().describe("The lecture number"),
+    lectureTopic: z.string().describe("The topic of the lecture"),
+    
+    // Source type and details
+    sourceType: z.enum(["local-file", "youtube", "api"]).describe("The type of source for the transcript"),
+    sourceLocation: z.string().describe("Local file path (relative to course path), YouTube URL, or API endpoint"),
+    
+    // For API sources only
+    apiMethod: z.enum(["GET", "POST"]).optional().describe("HTTP method for API requests"),
+    apiHeaders: z.record(z.string()).optional().describe("Headers for API requests"),
+    apiBody: z.string().optional().describe("Body for API POST requests"),
+    
+    // Output options (all optional with smart defaults)
+    outputDirectory: z.string().optional().describe("Directory to save notes (defaults to course notes path)"),
+    outputFilename: z.string().optional().describe("Filename for notes (default: auto-generated)"),
+    saveTranscript: z.boolean().default(true).describe("Whether to save the transcript to the transcript directory"),
+    transcriptFilename: z.string().optional().describe("Filename for saved transcript (default: auto-generated)"),
+    
+    // Optional formatting preferences
+    specialFormatting: z.string().optional().describe("Special formatting requirements"),
+    contentToEmphasize: z.string().optional().describe("Content that should be emphasized"),
+    otherInstructions: z.string().optional().describe("Any other instructions")
+  },
+  async (params) => {
+    try {
+      // 1. Resolve course paths
+      const notesPath = COURSE_NOTES_PATHS[params.courseName] || DEFAULT_NOTES_PATH;
+      const transcriptPath = COURSE_TRANSCRIPT_PATHS[params.courseName] || DEFAULT_TRANSCRIPT_PATH;
+      
+      if (!COURSE_NOTES_PATHS[params.courseName]) {
+        console.error(`Warning: Unknown course "${params.courseName}". Using default paths.`);
+      }
+      
+      // 2. Handle transcript acquisition based on source type
+      let transcriptContent = "";
+      let originalTranscriptPath = "";
+      
+      if (params.sourceType === "local-file") {
+        // For local files, use the transcript path + relative location if not absolute
+        originalTranscriptPath = path.isAbsolute(params.sourceLocation) 
+          ? params.sourceLocation 
+          : path.join(transcriptPath, params.sourceLocation);
+          
+        try {
+          transcriptContent = await fs.readFile(originalTranscriptPath, 'utf-8');
+        } catch (err) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: `Error: Could not read file at ${originalTranscriptPath}. Make sure the file exists and is accessible.`
+              }
+            ]
+          };
+        }
+      }
+      else if (params.sourceType === "youtube") {
+        // Call YouTube transcript downloader MCP
+        const ytCommand = `npx -y @anaisbetts/mcp-youtube ${params.sourceLocation}`;
+        transcriptContent = execSync(ytCommand).toString();
+        
+        // If saveTranscript is true, save a copy
+        if (params.saveTranscript) {
+          const ytTranscriptFilename = params.transcriptFilename || 
+            `${params.courseName.replace(/\s+/g, '-')}-Lecture-${params.lectureNumber}-YT.txt`;
+          originalTranscriptPath = path.join(transcriptPath, ytTranscriptFilename);
+          await fs.writeFile(originalTranscriptPath, transcriptContent);
+        }
+      }
+      else if (params.sourceType === "api") {
+        // Use curl-api MCP to fetch transcript
+        const method = params.apiMethod || "GET";
+        const headers = params.apiHeaders || {};
+        const body = params.apiBody || undefined;
+        
+        const curlCommand = `npx @modelcontextprotocol/server-curl ${params.sourceLocation} ${method} ${JSON.stringify(headers)} ${body ? JSON.stringify(body) : ''}`;
+        const apiResponse = JSON.parse(execSync(curlCommand).toString());
+        transcriptContent = apiResponse.data;
+        
+        // If saveTranscript is true, save a copy
+        if (params.saveTranscript) {
+          const apiTranscriptFilename = params.transcriptFilename || 
+            `${params.courseName.replace(/\s+/g, '-')}-Lecture-${params.lectureNumber}-API.txt`;
+          originalTranscriptPath = path.join(transcriptPath, apiTranscriptFilename);
+          await fs.writeFile(originalTranscriptPath, transcriptContent);
+        }
+      }
+      
+      // 3. Determine output directory (course path by default)
+      const outputDirectory = params.outputDirectory || notesPath;
+      
+      // 4. Generate output filename if not provided
+      const outputFilename = params.outputFilename || 
+        `${params.courseName.replace(/\s+/g, '-')}-Lecture-${params.lectureNumber}`;
+      
+      // 5. Generate or call note-taker service
+      const noteCommand = `node /Users/lmarte/Documents/Projects/mcp-servers/note-taker/build/index.js`;
+      
+      // Prepare prompt arguments
+      const promptArgs = {
+        courseName: params.courseName,
+        lectureNumber: params.lectureNumber,
+        lectureTopic: params.lectureTopic,
+        transcriptFilePath: transcriptPath,
+        outputDirectory: params.outputDirectory,
+        outputFilename: outputFilename,
+        specialFormatting: params.specialFormatting || "",
+        contentToEmphasize: params.contentToEmphasize || "",
+        otherInstructions: params.otherInstructions || ""
+      };
+      
+      const fullOutputPath = path.join(outputDirectory, `${outputFilename}.md`);
+      
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Notes successfully generated from ${params.sourceType} source!\n\n` +
+                  `Course: ${params.courseName}\n` +
+                  `Source: ${transcriptPath || params.sourceLocation}\n` +
+                  `Notes saved to: ${fullOutputPath}\n\n` +
+                  `Transcript length: ${transcriptContent.length} characters`
+          }
+        ]
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: `Error generating notes: ${errorMessage}`
+          }
+        ]
+      };
+    }
+  }
+);
+
+// Start server
 async function main() {
-  // Create a stdio transport for communication
-  // This allows the server to communicate with clients via standard input/output
-  const transport = new StdioServerTransport();
-
-  // Connect the server to the transport
-  // This starts listening for incoming messages and enables communication
-  await server.connect(transport);
-
-  // Log a message to indicate the server is running
-  // Note: Using console.error instead of console.log because stdout is used for MCP communication
-  console.error("MCP Server running on stdio");
+  try {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error("Transcript Manager MCP Server running");
+  } catch (error) {
+    console.error("Error starting server:", error);
+    process.exit(1);
+  }
 }
 
-// Call the main function and handle any fatal errors
-main().catch((error) => {
-  console.error("Fatal error in main():", error);
-  process.exit(1); // Exit with error code 1 if there's a fatal error
-});
+main();
